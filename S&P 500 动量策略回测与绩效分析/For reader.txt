@@ -1,0 +1,2 @@
+In my code, some data is downloaded directly from Yahoo through R. 
+Sometimes the data is wrong due to network reasons, so I put the running Rmd file in the compressed package for reading.
