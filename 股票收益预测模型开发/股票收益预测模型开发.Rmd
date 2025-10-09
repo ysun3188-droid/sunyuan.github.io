@@ -1,0 +1,777 @@
+---
+title: "project2"
+output: html_document
+date: "2024-10-23"
+---
+```{r}
+library(tidyverse)
+library(arrow)
+library(RSQLite)
+library(tidymodels)
+library(butcher)
+library(future)
+library(tidyfinance) # for portfolio sorts
+library(data.table)
+```
+
+Data preparation
+```{r}
+characteristics <- fread("GKX_20201231.csv")
+characteristics <- characteristics |>
+  rename(month = DATE) |>
+  mutate(
+    month = ymd(month),
+    month = floor_date(month, "month")
+  ) |>
+  rename_with(~ paste0("characteristic_", .), 
+              -c(permno, month, sic2,RET))
+
+characteristics <- characteristics |>
+  drop_na(sic2) |>
+  mutate(sic2 = as_factor(sic2))
+```
+
+cross-sectional ranking
+```{r}
+rank_transform <- function(x) {
+  rank_x <- rank(x)
+  rank_x[is.na(x)] <- NA
+  min_rank <- 1
+  max_rank <- length(na.omit(x))
+  
+  if (max_rank == 0) { # only NAs
+    return(rep(NA, length(x)))    
+  } else {
+    return(2 * ((rank_x - min_rank) / (max_rank - min_rank) - 0.5)) 
+  }
+}
+
+characteristics <- characteristics |>
+  group_by(month) |>
+  mutate(across(contains("characteristic"), rank_transform)) |>
+  ungroup()
+```
+
+deal with missing characteristics
+```{r}
+characteristics <- characteristics |>
+  group_by(month) |> 
+  mutate(across(contains("characteristic"), 
+                \(x) replace_na(x, median(x, na.rm = TRUE)))) |> 
+  ungroup()
+
+characteristics <- characteristics |>
+  mutate(across(contains("characteristic"), 
+                \(x) replace_na(x, 0)))
+```
+
+Macroeconomic Predictors and make them into SQL
+```{r}
+library(tidyverse)
+library(tidyfinance)
+library(scales)
+library(RSQLite)
+library(dbplyr)
+start_date <- ymd("1957-03-01")
+end_date <- ymd("2021-01-01")
+sheet_id <- "1bM7vCWd3WOt95Sf9qjLPZjoiafgF_8EG"
+sheet_name <- "Monthly"
+macro_predictors_url <- paste0(
+  "https://docs.google.com/spreadsheets/d/", sheet_id,
+  "/gviz/tq?tqx=out:csv&sheet=", sheet_name
+)
+macro_predictors_raw <- read_csv(macro_predictors_url)
+macro_predictors <- macro_predictors_raw |>
+  mutate(date = ym(yyyymm)) |>
+  mutate(across(where(is.character), as.numeric)) |>
+  mutate(
+    IndexDiv = Index + D12,
+    logret = log(IndexDiv) - log(lag(IndexDiv)),
+    Rfree = log(Rfree + 1),
+    rp_div = lead(logret - Rfree, 1), # Future excess market return
+    dp = log(D12) - log(Index), # Dividend Price ratio
+    dy = log(D12) - log(lag(Index)), # Dividend yield
+    ep = log(E12) - log(Index), # Earnings price ratio
+    de = log(D12) - log(E12), # Dividend payout ratio
+    tms = lty - tbl, # Term spread
+    dfy = BAA - AAA # Default yield spread
+  ) |>
+  rename(month = date) |>
+  select(
+    month, rp_div, dp, dy, ep, de, svar,
+    bm = `b/m`, ntis, tbl, lty, ltr,
+    tms, dfy, infl
+  ) |>
+  filter(month >= start_date & month <= end_date) |>
+  drop_na()
+dataset <- dbConnect(
+  SQLite(),
+  "dataset.sqlite",
+  extended_types = TRUE
+)
+dbWriteTable(
+  dataset,
+  "macro_predictors",
+  value = macro_predictors,
+  overwrite = TRUE
+)
+
+```
+
+merge them all
+```{r}
+dataset <- dbConnect(SQLite(), 
+                          "dataset.sqlite",
+                          extended_types = TRUE)
+
+
+
+macro_predictors <- tbl(dataset, "macro_predictors") |>
+  select(month, dp, ep, bm, ntis, tbl, tms, dfy, svar) |>
+  collect() |>
+  rename_with(~ paste0("macro_", .), -month)
+
+macro_predictors <- macro_predictors |>
+  select(month) |>
+  left_join(macro_predictors |> mutate(month = month %m+% months(1)), 
+            join_by(month))
+
+characteristics <- characteristics |>
+  inner_join(macro_predictors, join_by(month)) |>
+  arrange(month, permno) |>
+  mutate(macro_intercept = 1) |>
+  select(permno, month, RET,
+         sic2, contains("macro"), contains("characteristic"))
+```
+
+Creat dataset with all interaction terms
+The total number of covariates is 94×(8+1)+74=920
+I process my data year-by-year and store each portion separately to efficiently handle memory.
+```{r}
+library(dplyr)
+library(recipes)
+library(arrow)
+
+# Assume characteristics contains a column called 'year'
+characteristics <- characteristics |> mutate(year = year(month))
+
+# Create a function to process data for a single year
+process_and_save_year <- function(year_data, year) {
+  rec <- recipe(RET ~ ., data = year_data) |>
+    update_role(permno, month, new_role = "id") |>
+    step_interact(terms = ~ contains("characteristic"):contains("macro"), keep_original_cols = FALSE) |>
+    step_dummy(sic2, one_hot = TRUE)
+  
+  rec <- prep(rec)
+  baked_data <- bake(rec, new_data = year_data)
+  
+  # Store the processed data in Parquet format
+  write_parquet(baked_data, paste0("characteristics_", year, ".parquet"))
+}
+
+# Process each year separately
+unique_years <- unique(characteristics$year)
+for (year in unique_years) {
+  year_data <- characteristics |> filter(year == !!year)
+  process_and_save_year(year_data, year)
+}
+```
+
+Sample splitting and tuning
+```{r}
+validation_length <- 12
+
+estimation_periods <- tibble(testing_year = 1987:2021,
+                             validation_end = testing_year - 1,
+                             validation_start = testing_year - validation_length,
+                             training_start = 1957,
+                             training_end = validation_start - 1) |>
+  select(contains("training"), validation_start, validation_end, testing_year)
+
+visualization_data = pmap_dfr(estimation_periods, 
+                              \(training_start, 
+                                training_end, 
+                                validation_start, 
+                                validation_end, 
+                                testing_year){
+  tibble(year = 1957:2021,
+         classification = case_when(year >= training_start & year <= training_end ~ "Training",
+                                    year >= validation_start & year <= validation_end ~ "Validation",
+                                    year == testing_year ~ "testing"), 
+         testing_year)
+  }) |> 
+  drop_na()
+
+ggplot(visualization_data, 
+       aes(x = year, y = testing_year, color = classification)) +
+  geom_point(size = 1) +
+  labs(title = "Data classification timeline",
+       x = NULL, y = NULL, color = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+OLS +H
+```{r}
+# Load h2o package
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Use "./" to specify the current directory
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize an empty list to store the R^2 values and observation counts for each file
+r2_list <- list()
+counts <- c()
+
+# Iterate over each file, process the data, and store the results
+for (file_path in file_paths) {
+  
+  # Load data from the current file
+  data <- read_parquet(file_path)
+  h2o_data <- as.h2o(data)
+  
+  # Define the response variable and predictor variables
+  y <- "RET"
+  x <- setdiff(names(data), y)
+  
+  # Perform OLS regression using h2o.glm()
+  model <- h2o.glm(x = x, y = y, training_frame = h2o_data, family = "gaussian")
+  
+  # Calculate the R^2 for the current subset
+  performance <- h2o.performance(model, newdata = h2o_data)
+  r2 <- h2o.r2(performance)
+  
+  # Store the R^2 and observation count for the current file for weighted calculation
+  r2_list[[file_path]] <- r2
+  counts <- c(counts, nrow(data))
+  
+  # Clean up memory
+  h2o.rm(h2o_data)
+}
+
+# Calculate weighted R^2
+overall_r2 <- sum(unlist(r2_list) * counts) / sum(counts)
+print(paste("Overall R^2:", overall_r2))
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+
+
+```
+
+OLS_3 +H
+```{r}
+# Load necessary libraries
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Use "./" to specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize lists to store R^2 values and observation counts for each file
+r2_list <- list()
+counts <- c()
+
+# Loop through each file, process data, and store results
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Select only the required variables
+  data <- data[, c("RET", "characteristic_mvel1_x_macro_dp","characteristic_mvel1_x_macro_ep","characteristic_mvel1_x_macro_bm","characteristic_mvel1_x_macro_ntis",
+ "characteristic_mvel1_x_macro_tbl","characteristic_mvel1_x_macro_tms","characteristic_mvel1_x_macro_dfy","characteristic_mvel1_x_macro_svar","characteristic_bm_x_macro_dp","characteristic_bm_x_macro_ep","characteristic_bm_x_macro_bm","characteristic_bm_x_macro_ntis","characteristic_bm_x_macro_tbl","characteristic_bm_x_macro_tms","characteristic_bm_x_macro_dfy","characteristic_bm_x_macro_svar","characteristic_mom1m_x_macro_dp","characteristic_mom1m_x_macro_ep","characteristic_mom1m_x_macro_ntis","characteristic_mom1m_x_macro_tbl","characteristic_mom1m_x_macro_tms","characteristic_mom1m_x_macro_dfy","characteristic_mom1m_x_macro_svar","characteristic_mom1m_x_macro_bm")]
+  
+  # Upload selected data to the h2o cluster
+  h2o_data <- as.h2o(data)
+  
+  # Define response variable and predictor variables
+  y <- "RET"
+  x <- c("characteristic_mvel1_x_macro_dp","characteristic_mvel1_x_macro_ep","characteristic_mvel1_x_macro_bm","characteristic_mvel1_x_macro_ntis",
+ "characteristic_mvel1_x_macro_tbl","characteristic_mvel1_x_macro_tms","characteristic_mvel1_x_macro_dfy","characteristic_mvel1_x_macro_svar","characteristic_bm_x_macro_dp","characteristic_bm_x_macro_ep","characteristic_bm_x_macro_bm","characteristic_bm_x_macro_ntis","characteristic_bm_x_macro_tbl","characteristic_bm_x_macro_tms","characteristic_bm_x_macro_dfy","characteristic_bm_x_macro_svar","characteristic_mom1m_x_macro_dp","characteristic_mom1m_x_macro_ep","characteristic_mom1m_x_macro_ntis","characteristic_mom1m_x_macro_tbl","characteristic_mom1m_x_macro_tms","characteristic_mom1m_x_macro_dfy","characteristic_mom1m_x_macro_svar","characteristic_mom1m_x_macro_bm")
+  
+  # Perform OLS regression using h2o.glm with only selected predictors
+  model <- h2o.glm(x = x, y = y, training_frame = h2o_data, family = "gaussian")
+  
+  # Calculate R^2 for the current subset
+  performance <- h2o.performance(model, newdata = h2o_data)
+  r2 <- h2o.r2(performance)
+  
+  # Store the R^2 and the number of observations for weighting
+  r2_list[[file_path]] <- r2
+  counts <- c(counts, nrow(data))
+  
+  # Clean up to free memory
+  h2o.rm(h2o_data)
+}
+
+# Calculate weighted R^2
+overall_r2 <- sum(unlist(r2_list) * counts) / sum(counts)
+print(paste("Overall R^2:", overall_r2))
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+
+```
+
+
+Elastic Net with Huber Loss +H
+```{r}
+# Load necessary libraries
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Use "./" to specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize lists to store R^2 values and observation counts for each file
+r2_list <- list()
+counts <- c()
+
+# Loop through each file, process data, and store results
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Upload data to the h2o cluster
+  h2o_data <- as.h2o(data)
+  
+  # Define response variable and automatically select predictor variables
+  y <- "RET"
+  x <- setdiff(names(data), y)  # All columns except RET as predictors
+  
+  # Perform Elastic Net with Huber loss using h2o.deeplearning()
+  model <- h2o.deeplearning(x = x, y = y, training_frame = h2o_data,
+                            activation = "Rectifier",       # Simple activation function
+                            hidden = c(50, 50),             # Hidden layer structure
+                            epochs = 3,                     # Fewer training epochs
+                            loss = "Huber",                 # Use Huber loss
+                            huber_alpha = 0.9,              # Controls sensitivity of Huber loss
+                            l1 = 0.5,                       # Elastic Net mixing parameter for L1 regularization
+                            l2 = 0.5)                       # Elastic Net mixing parameter for L2 regularization
+  
+  # Calculate R^2 for the current subset
+  performance <- h2o.performance(model, newdata = h2o_data)
+  r2 <- h2o.r2(performance)
+  
+  # Store the R^2 and the number of observations for weighting
+  r2_list[[file_path]] <- r2
+  counts <- c(counts, nrow(data))
+  
+  # Clean up to free memory
+  h2o.rm(h2o_data)
+}
+
+# Calculate weighted R^2
+overall_r2 <- sum(unlist(r2_list) * counts) / sum(counts)
+print(paste("Overall R^2:", overall_r2))
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+```
+
+GLM +H with group loss
+```{r}
+# Load necessary libraries
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Use "./" to specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize lists to store R^2 values and observation counts for each file
+r2_list <- list()
+counts <- c()
+
+# Loop through each file, process data, and store results
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Upload data to the h2o cluster
+  h2o_data <- as.h2o(data)
+  
+  # Define response variable and automatically select predictor variables
+  y <- "RET"
+  x <- setdiff(names(data), y)  # All columns except RET as predictors
+  
+  # Perform GLM with group lasso using h2o.glm
+  model <- h2o.glm(x = x, y = y, training_frame = h2o_data,
+                   family = "gaussian",       # For linear regression
+                   alpha = 1,                 # L1 penalty for group lasso
+                   lambda_search = TRUE)      # Automatically search for the best lambda
+  
+  # Calculate R^2 for the current subset
+  performance <- h2o.performance(model, newdata = h2o_data)
+  r2 <- h2o.r2(performance)
+  
+  # Store the R^2 and the number of observations for weighting
+  r2_list[[file_path]] <- r2
+  counts <- c(counts, nrow(data))
+  
+  # Clean up to free memory
+  h2o.rm(h2o_data)
+}
+
+# Calculate weighted R^2
+overall_r2 <- sum(unlist(r2_list) * counts) / sum(counts)
+print(paste("Overall R^2:", overall_r2))
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+```
+
+random forest
+```{r}
+# Load necessary libraries
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Use "./" to specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize lists to store R^2 values and observation counts for each file
+r2_list <- list()
+counts <- c()
+
+# Loop through each file, process data, and store results
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Upload data to the h2o cluster
+  h2o_data <- as.h2o(data)
+  
+  # Define response variable and automatically select predictor variables
+  y <- "RET"
+  x <- setdiff(names(data), y)  # All columns except RET as predictors
+  
+  # Train Random Forest model with optimized parameters for faster runtime
+  model <- h2o.randomForest(x = x, y = y, training_frame = h2o_data,
+                            ntrees = 50,           # Reduced number of trees
+                            max_depth = 10,        # Reduced max depth
+                            sample_rate = 0.8,     # Use 80% of data for each tree
+                            seed = 1234)           # For reproducibility
+  
+  # Calculate R^2 for the current subset
+  performance <- h2o.performance(model, newdata = h2o_data)
+  r2 <- h2o.r2(performance)
+  
+  # Store the R^2 and the number of observations for weighting
+  r2_list[[file_path]] <- r2
+  counts <- c(counts, nrow(data))
+  
+  # Clean up to free memory
+  h2o.rm(h2o_data)
+}
+
+# Calculate weighted R^2
+overall_r2 <- sum(unlist(r2_list) * counts) / sum(counts)
+print(paste("Overall R^2:", overall_r2))
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+```
+
+PLS
+```{r}
+# Load necessary libraries
+library(arrow)
+library(pls)
+
+# Specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize lists to store R^2 values and observation counts for each month and year
+monthly_pls_r2_list <- list()
+monthly_counts <- list()
+annual_pls_r2_list <- list()
+annual_counts <- list()
+
+# Loop through each file, process data, and store results
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Check for required columns
+  if (!all(c("month", "year", "RET") %in% names(data))) next
+  
+  # Define predictor variables (all columns except RET, month, and year)
+  x <- setdiff(names(data), c("RET", "month", "year"))
+  
+  # Loop through each unique month and calculate PLS R^2
+  for (month in unique(data$month)) {
+    monthly_data <- data[data$month == month, ]
+    if (nrow(monthly_data) < 2) next
+    
+    predictors <- as.matrix(monthly_data[, x])
+    response <- monthly_data$RET
+    
+    # Partial Least Squares Regression without cross-validation
+    pls_model <- plsr(response ~ predictors, ncomp = 5)
+    pls_r2 <- 1 - sum((response - predict(pls_model, predictors)[,,5])^2) / sum((response - mean(response))^2)
+    
+    # Store the R^2 and the count of observations for weighting
+    monthly_pls_r2_list[[paste0(file_path, "_month_", month)]] <- pls_r2
+    monthly_counts[[paste0(file_path, "_month_", month)]] <- nrow(monthly_data)
+  }
+  
+  # Loop through each unique year and calculate PLS R^2
+  for (year in unique(data$year)) {
+    annual_data <- data[data$year == year, ]
+    if (nrow(annual_data) < 2) next
+    
+    predictors <- as.matrix(annual_data[, x])
+    response <- annual_data$RET
+    
+    # Partial Least Squares Regression without cross-validation
+    pls_model <- plsr(response ~ predictors, ncomp = 5)
+    pls_r2 <- 1 - sum((response - predict(pls_model, predictors)[,,5])^2) / sum((response - mean(response))^2)
+    
+    # Store the R^2 and the count of observations for weighting
+    annual_pls_r2_list[[paste0(file_path, "_year_", year)]] <- pls_r2
+    annual_counts[[paste0(file_path, "_year_", year)]] <- nrow(annual_data)
+  }
+}
+
+# Calculate weighted monthly and annual R^2 for PLS
+overall_monthly_pls_r2 <- sum(unlist(monthly_pls_r2_list) * unlist(monthly_counts)) / sum(unlist(monthly_counts))
+print(paste("Overall Monthly PLS R^2:", overall_monthly_pls_r2))
+
+overall_annual_pls_r2 <- sum(unlist(annual_pls_r2_list) * unlist(annual_counts)) / sum(unlist(annual_counts))
+print(paste("Overall Annual PLS R^2:", overall_annual_pls_r2))
+
+```
+PCR
+```{r}
+# Load necessary libraries
+library(arrow)
+library(pls)
+
+# Specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize lists to store R^2 values and observation counts for each month and year
+monthly_pcr_r2_list <- list()
+monthly_counts <- list()
+annual_pcr_r2_list <- list()
+annual_counts <- list()
+
+# Loop through each file, process data, and store results
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Check for required columns
+  if (!all(c("month", "year", "RET") %in% names(data))) next
+  
+  # Define predictor variables (all columns except RET, month, and year)
+  x <- setdiff(names(data), c("RET", "month", "year"))
+  
+  # Loop through each unique month and calculate PCR R^2
+  for (month in unique(data$month)) {
+    monthly_data <- data[data$month == month, ]
+    if (nrow(monthly_data) < 2) next
+    
+    predictors <- as.matrix(monthly_data[, x])
+    response <- monthly_data$RET
+    
+    # Principal Component Regression without cross-validation
+    pcr_model <- pcr(response ~ predictors, ncomp = 5)
+    pcr_r2 <- 1 - sum((response - predict(pcr_model, predictors)[,,5])^2) / sum((response - mean(response))^2)
+    
+    # Store the R^2 and the count of observations for weighting
+    monthly_pcr_r2_list[[paste0(file_path, "_month_", month)]] <- pcr_r2
+    monthly_counts[[paste0(file_path, "_month_", month)]] <- nrow(monthly_data)
+  }
+  
+  # Loop through each unique year and calculate PCR R^2
+  for (year in unique(data$year)) {
+    annual_data <- data[data$year == year, ]
+    if (nrow(annual_data) < 2) next
+    
+    predictors <- as.matrix(annual_data[, x])
+    response <- annual_data$RET
+    
+    # Principal Component Regression without cross-validation
+    pcr_model <- pcr(response ~ predictors, ncomp = 5)
+    pcr_r2 <- 1 - sum((response - predict(pcr_model, predictors)[,,5])^2) / sum((response - mean(response))^2)
+    
+    # Store the R^2 and the count of observations for weighting
+    annual_pcr_r2_list[[paste0(file_path, "_year_", year)]] <- pcr_r2
+    annual_counts[[paste0(file_path, "_year_", year)]] <- nrow(annual_data)
+  }
+}
+
+# Calculate weighted monthly and annual R^2 for PCR
+overall_monthly_pcr_r2 <- sum(unlist(monthly_pcr_r2_list) * unlist(monthly_counts)) / sum(unlist(monthly_counts))
+print(paste("Overall Monthly PCR R^2:", overall_monthly_pcr_r2))
+
+overall_annual_pcr_r2 <- sum(unlist(annual_pcr_r2_list) * unlist(annual_counts)) / sum(unlist(annual_counts))
+print(paste("Overall Annual PCR R^2:", overall_annual_pcr_r2))
+
+```
+
+importance of covariate top 10 with elastic net +H
+```{r}
+# Load necessary libraries
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Specify the directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize list to store variable importance from each model
+importance_list <- list()
+counts <- 0
+
+# Loop through each file, train model, and store variable importance
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  h2o_data <- as.h2o(data)
+  
+  # Define response and predictor variables
+  y <- "RET"
+  x <- setdiff(names(data), y)
+  
+  # Train Elastic Net model on current subset
+  model <- h2o.glm(x = x, y = y, training_frame = h2o_data, 
+                   family = "gaussian",             # For regression
+                   alpha = 0.5,                     # Elastic Net mixing parameter
+                   lambda_search = TRUE)            # Enable automatic lambda tuning
+  
+  # Get variable importance and store it
+  importance <- as.data.frame(h2o.varimp(model))
+  importance_list[[file_path]] <- importance
+  
+  # Count the number of models (for averaging later)
+  counts <- counts + 1
+  
+  # Clean up to free memory
+  h2o.rm(h2o_data)
+}
+
+# Aggregate variable importance by averaging across models
+importance_df <- Reduce(function(x, y) merge(x, y, by = "variable", all = TRUE), importance_list)
+importance_df[is.na(importance_df)] <- 0  # Replace NAs with 0 for averaging
+importance_df$average_importance <- rowMeans(importance_df[, -1])
+
+# Sort by average importance and select the top 10 variables
+top_10_importance <- importance_df[order(-importance_df$average_importance), ][1:10, c("variable", "average_importance")]
+
+# Print top 10 most important features
+print(top_10_importance)
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+# Load ggplot2 library for plotting
+library(ggplot2)
+
+# Exclude "month" and "sic_x35" from the data frame
+filtered_importance <- top_10_importance[!top_10_importance$variable %in% c("month"), ]
+
+# Plot the filtered top importance features
+ggplot(filtered_importance, aes(x = reorder(variable, average_importance), y = average_importance)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +  # Flip coordinates to make it horizontal
+  labs(title = "Top Feature Importance Elastice net", x = "Feature", y = "Average Importance") +
+  theme_minimal()
+
+```
+
+importance of covariate top 10 with GLM +H
+```{r}
+# Load necessary libraries
+library(h2o)
+library(arrow)
+h2o.init()
+
+# Use "./" to specify the current directory containing Parquet files
+file_paths <- list.files(path = "./", pattern = "\\.parquet$", full.names = TRUE)
+
+# Initialize list to store variable importance from each model
+importance_list <- list()
+counts <- 0
+
+# Loop through each file, process data, and store variable importance
+for (file_path in file_paths) {
+  
+  # Load data for the current file
+  data <- read_parquet(file_path)
+  
+  # Upload data to the h2o cluster
+  h2o_data <- as.h2o(data)
+  
+  # Define response and predictor variables
+  y <- "RET"
+  x <- setdiff(names(data), y)  # All columns except RET as predictors
+  
+  # Train GLM with group lasso
+  model <- h2o.glm(x = x, y = y, training_frame = h2o_data,
+                   family = "gaussian",       # For linear regression
+                   alpha = 1,                 # L1 penalty for group lasso
+                   lambda_search = TRUE)      # Automatically search for the best lambda
+  
+  # Get variable importance and store it
+  importance <- as.data.frame(h2o.varimp(model))
+  importance_list[[file_path]] <- importance
+  
+  # Count the number of models (for averaging later)
+  counts <- counts + 1
+  
+  # Clean up to free memory
+  h2o.rm(h2o_data)
+}
+
+# Aggregate variable importance by averaging across models
+importance_df <- Reduce(function(x, y) merge(x, y, by = "variable", all = TRUE), importance_list)
+importance_df[is.na(importance_df)] <- 0  # Replace NAs with 0 for averaging
+importance_df$average_importance <- rowMeans(importance_df[, -1])
+
+# Sort by average importance and select the top 10 variables
+top_10_importance <- importance_df[order(-importance_df$average_importance), ][1:10, c("variable", "average_importance")]
+
+# Print top 10 most important features
+print(top_10_importance)
+
+# Shut down h2o
+h2o.shutdown(prompt = FALSE)
+
+# Load ggplot2 library for plotting
+library(ggplot2)
+
+# Exclude "month" and "sic_x35" from the data frame
+filtered_importance <- top_10_importance[!top_10_importance$variable %in% c("month", "sic_x35"), ]
+
+# Plot the filtered top importance features
+ggplot(filtered_importance, aes(x = reorder(variable, average_importance), y = average_importance)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +  # Flip coordinates to make it horizontal
+  labs(title = "Top Feature Importance GLM", x = "Feature", y = "Average Importance") +
+  theme_minimal()
+
+
+```
+
+
