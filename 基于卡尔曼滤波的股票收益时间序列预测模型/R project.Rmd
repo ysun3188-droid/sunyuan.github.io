@@ -1,0 +1,102 @@
+---
+title: "Kalman in time series"
+author: "SUN Yuan 20907565"
+date: "2023-11-25"
+output: html_document
+---
+```{r}
+Sys.setenv(LANG="en")
+library(caret)
+library(quantmod)
+library(xts)
+library(MASS)
+# Load data
+data <- read.table("TSLA.csv", sep = ',', header = TRUE)
+
+# Convert the data to a time series object (xts)
+data$Date <- as.Date(data$Date)
+data_xts <- xts(data[, -1], order.by = data$Date)
+
+# Calculate log returns
+log_returns <- diff(log(data_xts$Close))[-1]
+
+# Create a lagged version of log returns as a feature
+lagged_returns <- lag(log_returns, k = 1)
+
+# Combine the lagged returns with the original log returns
+model_data <- cbind(log_returns, lagged_returns)
+colnames(model_data) <- c("log_returns", "lagged_returns")
+
+# Train-test split
+set.seed(123)
+split_ratio <- 0.8
+train_indices <- createDataPartition(model_data$log_returns, p = split_ratio, list = FALSE)
+train_data <- model_data[train_indices, ]
+test_data <- model_data[-train_indices, ]
+# Build a linear regression model
+lm_model <- lm(log_returns ~ lagged_returns, data = train_data)
+# Make predictions on the test set
+predictions <- predict(lm_model, newdata = test_data)
+
+# Create a time series object for predictions with the same index as the test data
+predictions_ts <- xts(predictions, order.by = index(test_data))
+# Plot both actual log return curve and predicted curve on the same plot
+plot(test_data$log_returns, type = 'l', col = 'blue', 
+     main = 'IID Model on Log Returns', ylab = 'Log Returns')
+lines(predictions_ts, col = 'red')
+# Evaluate the model
+ME <- mean(abs(predictions_ts-test_data$log_returns))
+cat('Mean Error:', ME, '\n')
+
+```
+
+```{r}
+library(forecast)
+library(tseries)
+set.seed(123)
+data <- read.table("TSLA.csv", sep=',', header=T)
+measure <- data$Close
+log_returns <- diff(log(measure))[-1]  # compute log returns
+# Fit an ARMA model to the  log returns
+arma_model <- arima(log_returns, order = c(1,2,1))  # Adjust order as needed
+# Plot the fitted values and actual values
+fitted_values <- fitted(arma_model)
+plot(log_returns, type = 'l', col = 'blue',xlab = 'time',main = 'VARIMA Model on  Log Returns')
+lines(fitted_values, col = 'red')
+legend("topright", legend = c("Actual", "Fitted"), col = c("blue", "red"), lty = 1)
+residuals <- log_returns - fitted_values
+ME <- mean(abs(residuals))
+cat("ME:", ME, "\n")
+```
+
+```{r}
+library(dlm)
+library(forecast)
+library(tseries)
+set.seed(123)
+data <- read.table("TSLA.csv", sep=',', header=T)
+measure <- data$Close
+log_returns <- diff(log(measure))[-1]  # compute log returns
+# Fit an ARIMA model to the differenced log returns
+arma_model <- arima(log_returns, order = c(1, 0, 1))  # Adjust order as needed
+# Extract ARIMA coefficients
+phi <- coef(arma_model)[2]
+theta <- coef(arma_model)[3]
+sigma2 <- sum(resid(arma_model)^2) / length(log_returns)
+# Define the state space model
+state_space_model <- dlmModARMA(ar = phi, ma = theta, sigma2 = sigma2)
+# Apply the Kalman filter
+kf_results <- dlmFilter(log_returns, mod = state_space_model)
+# Extract filtered states
+filtered_states <- as.vector(kf_results$m[-1, 1])  # Skip the first state which is not present in the input data
+# Create a new plot for the actual differenced log returns
+plot(log_returns, type = 'l', col = 'blue', xlab = 'Time', ylab = 'Log Returns',main = 'VARIMA Model (Kalman) on Log Returns')
+lines(fitted_values, col = 'red')
+# Add legend
+legend("topright", legend = c("Filtered States", "Actual  Log Returns"), col = c("blue", "red"), lty = 1)
+residuals <-log_returns - filtered_states
+ME <- mean(abs(residuals))
+cat("ME:", ME, "\n")
+```
+
+
