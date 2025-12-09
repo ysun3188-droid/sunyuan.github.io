@@ -298,8 +298,98 @@ class DataGenerator:
 
     def _generate_smb_data(self, n_samples: int) -> pd.DataFrame:
         """生成中小企业数据"""
-        # 简化实现
-        return self._generate_personal_data(n_samples)
+         np.random.seed(42)
+        
+        data = {}
+        
+        # 1. 企业基本信息
+        data['company_age'] = np.random.exponential(5, n_samples).clip(0.5, 30)
+        data['industry'] = np.random.choice(['Retail', 'Manufacturing', 'Tech', 'Construction', 
+                                            'Hospitality', 'Healthcare', 'Professional Services'], 
+                                           n_samples, p=[0.2, 0.15, 0.1, 0.15, 0.1, 0.1, 0.2])
+        data['num_employees'] = np.random.choice([1, 5, 10, 50, 100, 500], n_samples, p=[0.2, 0.3, 0.2, 0.15, 0.1, 0.05])
+        data['location'] = np.random.choice(['Urban', 'Suburban', 'Rural'], n_samples, p=[0.6, 0.3, 0.1])
+        
+        # 2. 财务信息
+        data['annual_revenue'] = np.random.lognormal(12, 1.5, n_samples)  # 均值约160万
+        data['gross_profit_margin'] = np.random.beta(5, 2, n_samples)  # 0-1之间
+        data['operating_margin'] = data['gross_profit_margin'] * np.random.uniform(0.6, 0.9, n_samples)
+        data['net_income'] = data['annual_revenue'] * np.random.beta(3, 10, n_samples)
+        data['total_assets'] = data['annual_revenue'] * np.random.uniform(0.5, 2, n_samples)
+        data['total_liabilities'] = data['total_assets'] * np.random.beta(3, 5, n_samples)
+        data['current_assets'] = data['total_assets'] * np.random.uniform(0.2, 0.6, n_samples)
+        data['current_liabilities'] = data['total_liabilities'] * np.random.uniform(0.3, 0.8, n_samples)
+        data['cash_balance'] = data['current_assets'] * np.random.uniform(0.1, 0.4, n_samples)
+        
+        # 3. 经营指标
+        data['revenue_growth_1y'] = np.random.normal(0.1, 0.3, n_samples)
+        data['revenue_growth_3y'] = np.random.normal(0.08, 0.2, n_samples)
+        data['profit_growth_1y'] = np.random.normal(0.05, 0.4, n_samples)
+        data['customer_concentration'] = np.random.beta(2, 5, n_samples)  # 大客户依赖度
+        
+        # 4. 管理层信息
+        data['ceo_experience'] = np.random.exponential(10, n_samples).clip(1, 40)
+        data['management_quality'] = np.random.choice(['Poor', 'Fair', 'Good', 'Excellent'], 
+                                                      n_samples, p=[0.1, 0.3, 0.4, 0.2])
+        
+        # 5. 贷款信息
+        data['loan_amount'] = data['annual_revenue'] * np.random.uniform(0.1, 0.5, n_samples)
+        data['loan_term'] = np.random.choice([12, 24, 36, 48, 60], n_samples, p=[0.1, 0.2, 0.3, 0.3, 0.1])
+        data['interest_rate'] = np.random.normal(6, 2, n_samples).clip(4, 12)
+        data['loan_purpose'] = np.random.choice(['Working Capital', 'Equipment', 'Expansion', 
+                                               'Inventory', 'Debt Refinance'], 
+                                              n_samples, p=[0.4, 0.2, 0.2, 0.1, 0.1])
+        
+        # 6. 计算财务比率
+        data['current_ratio'] = data['current_assets'] / (data['current_liabilities'] + 1e-6)
+        data['quick_ratio'] = (data['current_assets'] - data.get('inventory', 0)) / (data['current_liabilities'] + 1e-6)
+        data['debt_to_equity'] = data['total_liabilities'] / (data['total_assets'] - data['total_liabilities'] + 1e-6)
+        data['debt_service_coverage'] = data['net_income'] / (data['total_liabilities'] * 0.1 + 1e-6)  # 假设10%利率
+        data['roe'] = data['net_income'] / (data['total_assets'] - data['total_liabilities'] + 1e-6)
+        data['roa'] = data['net_income'] / (data['total_assets'] + 1e-6)
+        
+        # 7. 生成违约标签
+        default_prob = np.zeros(n_samples)
+        
+        # 财务风险
+        financial_risk = np.where(data['current_ratio'] < 1, 0.2,
+                                 np.where(data['current_ratio'] < 1.5, 0.1, 0.02))
+        
+        debt_risk = np.where(data['debt_to_equity'] > 2, 0.3,
+                           np.where(data['debt_to_equity'] > 1, 0.15, 0.05))
+        
+        # 经营风险
+        revenue_risk = np.where(data['revenue_growth_1y'] < -0.1, 0.2,
+                              np.where(data['revenue_growth_1y'] < 0, 0.1, 0.02))
+        
+        # 规模风险
+        size_risk = np.where(data['num_employees'] < 10, 0.1,
+                           np.where(data['num_employees'] < 50, 0.05, 0.02))
+        
+        # 行业风险
+        industry_risk = np.where(data['industry'].isin(['Construction', 'Hospitality']), 0.1,
+                               np.where(data['industry'].isin(['Tech']), 0.15, 0.05))
+        
+        # 贷款风险
+        loan_risk = np.where(data['loan_amount'] / data['annual_revenue'] > 0.5, 0.2,
+                           np.where(data['loan_amount'] / data['annual_revenue'] > 0.3, 0.1, 0.03))
+        
+        # 组合风险
+        base_risk = 0.08
+        combined_risk = (financial_risk + debt_risk + revenue_risk + 
+                        size_risk + industry_risk + loan_risk) / 6
+        
+        default_prob = base_risk + combined_risk
+        default_prob = np.clip(default_prob, 0, 1)
+        
+        # 添加随机噪声
+        default_prob += np.random.normal(0, 0.05, n_samples)
+        default_prob = np.clip(default_prob, 0, 1)
+        
+        data['default_probability'] = default_prob
+        data['default'] = np.random.binomial(1, default_prob)
+        
+        return pd.DataFrame(data)
 
     def _generate_corporate_data(self, n_samples: int) -> pd.DataFrame:
         """生成上市公司数据"""
@@ -1507,4 +1597,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
