@@ -1,6 +1,6 @@
 """
 ================================================================================
-项目一：基于多因子模型与机器学习的A股量化策略研究
+项目名称：基于多因子模型与机器学习的A股量化策略研究
 技术栈：Pandas, NumPy, Backtrader, Scikit-learn, LightGBM, 因子分析, 机器学习
 数据源：AKShare (免费A股数据接口)
 ================================================================================
@@ -1380,5 +1380,6 @@ if __name__ == "__main__":
     # 安装所需库
     print(
         "安装所需库: pip install akshare tushare pandas numpy scipy scikit-learn lightgbm xgboost backtrader matplotlib seaborn tqdm statsmodels")
+
 
     data_fetcher, ml_model, cerebro = main()
