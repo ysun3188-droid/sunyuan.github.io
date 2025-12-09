@@ -128,7 +128,7 @@ class AShareDataFetcher:
 
                 elif self.data_source == 'tushare' and TUSHARE_AVAILABLE:
                     # 使用Tushare获取数据
-                    ts.set_token('你的token')  # 需要替换为你的token
+                    ts.set_token('mytoken')
                     pro = ts.pro_api()
 
                     df = pro.daily(ts_code=f"{symbol}.SZ" if symbol.startswith('0') else f"{symbol}.SH",
@@ -321,7 +321,6 @@ class AShareDataFetcher:
                 factors['SMA_RATIO_20_60'] = sma_20 / sma_60 - 1
 
                 # === 5. 估值因子（模拟）===
-                # 在真实项目中，这些需要从财务报表获取
                 factors['PE_RATIO'] = np.random.lognormal(2.5, 0.5, len(factors))  # 模拟PE
                 factors['PB_RATIO'] = np.random.lognormal(1, 0.3, len(factors))  # 模拟PB
                 factors['PS_RATIO'] = np.random.lognormal(2, 0.4, len(factors))  # 模拟PS
